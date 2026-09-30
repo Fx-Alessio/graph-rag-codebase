@@ -1,140 +1,113 @@
-# Graph-RAG per Codebase
+# Graph-RAG for Codebases
 
-Uno strumento che analizza una codebase Python e ne costruisce un grafo (chiamate, ereditarietà, import), per
-recuperare — dato il nome di una funzione — il contesto minimo ma completo da passare a un LLM che deve
-modificarla: le sue dipendenze, chi la chiama, le sottoclassi che la ridefiniscono. L'obiettivo è ridurre il
-rischio che un'AI "perda pezzi" o rompa qualcosa di collegato che non vedeva.
+When an LLM is asked to change a piece of code, it usually only sees what you hand it: a file, a function, maybe
+a couple of lines of surrounding context. It has no real way of knowing what else in the project depends on that
+code, or what would break if it changed. This project is an attempt to fix that for Python codebases: it builds a
+static graph of a repository — who calls whom, who inherits from whom, who imports what — and uses that graph to
+hand an LLM the *minimal but complete* context it needs before touching a function, instead of leaving it to guess.
 
-Ispirato a un approccio di graph-RAG su codice per limitare le allucinazioni di un'AI che lavora su codice
-esistente, mantenendo sempre visibili le dipendenze rilevanti.
+The idea isn't new — a few engineers working on AI coding tools have described similar graph-RAG setups to keep an
+agent from hallucinating dependencies it can't see. This is a from-scratch implementation of that idea, built to
+actually measure whether it helps, not just to assume it does.
 
-## Perché
+## A small example that makes the point
 
-Quando un LLM riceve solo il file (o la funzione) da modificare, non ha modo di sapere cosa altro nel progetto
-dipende da quel pezzo di codice. Il rischio è modificare una funzione senza accorgersi che, per esempio, altri tre
-moduli la chiamano o che una sottoclasse la ridefinisce. Questo progetto costruisce staticamente la mappa di quelle
-relazioni e la usa per comporre un contesto mirato, invece di affidarsi alla sola finestra di codice che l'LLM ha
-sotto gli occhi.
+[`tqdm`](https://github.com/tqdm/tqdm), the progress-bar library, is the test repo here. Take `tqdm.write()`, the
+method you call to print a message without breaking the progress bar. On its own it's nine unremarkable lines:
 
-## Esempio concreto
+```python
+@classmethod
+def write(cls, s, file=None, end="\n", nolock=False):
+    """Print a message via tqdm (without overlap with bars)."""
+    fp = file if file is not None else sys.stdout
+    ...
+```
 
-Il repo di test è [`tqdm`](https://github.com/tqdm/tqdm). Il metodo `tqdm.write()` è 9 righe; guardandolo da solo
-non si direbbe che ha 11 punti collegati nel resto del progetto:
+Nothing about those nine lines tells you that three other modules in the same package — the ones that send
+progress updates to Slack, Discord and Telegram bots — all route through this exact method. Change its signature
+without knowing that, and you've quietly broken three integrations. Ask this project for the context around
+`tqdm.write`, and it tells you so up front, along with everything else that calls it or that it depends on:
 
 ```
 $ python -m src.cli context tqdm.write --no-semantic
 
-## Cosa chiama il target (dipendenze)
+## What the target calls (dependencies)
 ### tqdm.std:tqdm.external_write_mode
 ### tqdm.std:tqdm.get_lock
 
-## Chi chiama il target (impatto di una modifica)
+## Who calls the target (blast radius of a change)
 ### tqdm.contrib.discord:DiscordIO.write
 ### tqdm.contrib.slack:SlackIO.write
 ### tqdm.contrib.telegram:TelegramIO.write
-... (altri 6 chiamanti/sottoclassi)
+... (6 more callers / subclasses)
 ```
 
-Modificare la firma di `write()` senza saperlo romperebbe silenziosamente le integrazioni con Slack, Discord e
-Telegram. Questo è esattamente il tipo di dipendenza che il progetto vuole rendere visibile prima che venga rotta.
+That's the whole pitch of the project in one example: turn "nine lines with no visible dependents" into "nine
+lines plus the eleven things you'd otherwise break."
 
-## Come funziona, in breve
+## How it fits together
 
-```
-repo Python ──► parser (ast)  ──► graph.json ──► networkx / embedding ──► retrieval ──► contesto per l'LLM
-```
+The pipeline is a straight line: a parser walks the repo with Python's own `ast` module and writes out every
+function, class and method as a *node*, and every call, import and inheritance relationship as an *edge*. That
+graph gets loaded into `networkx` so it can be walked and queried, and each node also gets a semantic embedding
+(via `sentence-transformers`, stored in ChromaDB) so you can find a starting point by *meaning* rather than by
+exact name when you don't know what something is called. The retrieval step ties the two together: given a
+target, it expands outward along the graph — dependencies, callers, base classes, overrides — ranks what it finds
+by a mix of graph distance and semantic similarity, and assembles a context string within a size budget. On top of
+that sits an evaluation harness that actually calls the Claude API with and without the retrieved context on a
+couple of realistic tasks, to check whether any of this changes the answer for the better — and, finally, an MCP
+server that exposes the whole thing as a tool an agent like Claude Code can call on its own mid-session, instead
+of a human copying context into a chat window by hand.
 
-1. **Parser** (`src/parser.py`): legge il codice con `ast` e produce nodi (moduli, classi, funzioni, metodi) e archi
-   (`defines`, `imports`, `inherits`, `calls`), risolvendo staticamente alias, re-export e import condizionali.
-2. **Grafo** (`src/graph.py`): carica il risultato in `networkx` per interrogarlo (hub, componenti, espansione).
-3. **Layer semantico** (`src/semantic.py`): un embedding per nodo (`sentence-transformers`, locale) in ChromaDB,
-   per trovare un punto di partenza per significato quando non si conosce il nome esatto.
-4. **Retrieval ibrido** (`src/retrieval.py`): dato un nodo target, espande il grafo (dipendenze, chiamanti,
-   ereditarietà, override) e ordina per rilevanza = grafo + similarità semantica, entro un budget di caratteri.
-5. **Valutazione** (`src/eval.py`): confronto con/senza il contesto recuperato su task di test reali, usando
-   l'API di Claude.
-6. **Server MCP** (`src/mcp_server.py`): espone il retrieval come tool (`get_context`, `search_code`,
-   `list_nodes`) a un agente come Claude Code, così può richiederlo da solo durante una sessione di lavoro.
+Every one of those steps has sharp edges — static analysis can't know the type of a variable, semantic search on
+a generic embedding model is noisy, a rename can hide behind a call on an object of unknown type — and the project
+tries to be honest about them rather than pretend the graph is complete. The retrieved context explicitly lists
+the calls it *couldn't* resolve, so an LLM (or a person) knows what it's not being told, not just what it is.
 
-## Quickstart
+## Trying it
 
-Richiede **Python 3.12+** (l'SDK MCP della Fase 6 non funziona con 3.9/3.10).
+You'll need Python 3.12+ (the MCP SDK used in the last phase doesn't run on 3.9/3.10, which is what this started
+on before that became a problem worth solving).
 
 ```bash
 git clone https://github.com/Fx-Alessio/graph-rag-codebase
 cd graph-rag-codebase
-python3.12 -m venv .venv
-source .venv/bin/activate
+python3.12 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# repo di test (escluso dal repository, va clonato a parte)
-git clone https://github.com/tqdm/tqdm test_repo/tqdm
+git clone https://github.com/tqdm/tqdm test_repo/tqdm   # the test repo, not checked into this one
 
 python -m src.cli build test_repo/tqdm      # -> output/graph.json
-python -m src.cli viz --open                # -> output/graph.html (grafo interattivo)
-python -m src.cli index                     # embedding dei nodi (scarica un modello ~90 MB la prima volta)
+python -m src.cli viz --open                # -> an interactive graph in the browser
+python -m src.cli index                     # embeds every node (downloads a small model once)
 python -m src.cli search "detect terminal width"
-python -m src.cli context tqdm.update       # il comando centrale del progetto
+python -m src.cli context tqdm.update       # the command that matters most
 ```
 
-`output/graph.json` e `output/graph.html` sono già inclusi nel repository (generati su `tqdm`), quindi si può
-guardare il grafo anche senza rifare `build`.
+`output/graph.json` and `output/graph.html` already ship in the repo, built from `tqdm`, so there's something to
+look at even before running `build` yourself.
 
-### Confronto con/senza retrieval (Fase 5)
+Comparing answers with and without retrieval (`python -m src.cli eval`) calls the real Claude API and needs an
+`ANTHROPIC_API_KEY` in a local `.env` file (never committed); it costs a few cents in tokens. On the two test
+tasks used here — propagating a new parameter across four subclasses, and renaming a method with callers hidden
+behind untyped variables — the plan produced with retrieved context caught every point that needed touching,
+where the same request without context caught half of them in one case and four out of five in the other.
 
-Richiede una `ANTHROPIC_API_KEY` in un file `.env` nella radice del progetto (mai committato) e fa chiamate reali
-all'API, quindi ha un piccolo costo:
+Wiring this into Claude Code as an MCP server is a matter of copying `.mcp.json.example` to `.mcp.json`, pointing
+it at your own checkout, and approving the server once (`claude mcp list` shows whether it's pending).
 
-```bash
-echo "ANTHROPIC_API_KEY=..." > .env
-python -m src.cli eval
-```
+## Where things stand
 
-Su due task di test (aggiungere un parametro che deve propagarsi a 4 sottoclassi; rinominare un metodo con
-chiamanti nascosti dietro variabili di tipo ignoto), il piano di modifica con il contesto recuperato trova il
-100% dei punti da toccare in entrambi i casi, contro il 50% e l'80% senza contesto. Dettagli e limiti del metodo
-in `output/eval/` dopo l'esecuzione.
+The first six phases of the plan are done: the parser, the graph layer, the semantic index, the hybrid retrieval,
+the with/without evaluation, and the MCP server. A seventh, optional phase — reimplementing the retrieval logic
+with LangGraph and comparing it to the hand-written version — was left undone; it's a comparison of frameworks
+more than a feature, and didn't seem worth the time yet. The full plan is in [`PLAN.md`](PLAN.md), and every
+technical decision along the way — why static analysis over-approximates instead of under-approximating, why
+ChromaDB over FAISS, why the ranking weights are what they are, what broke and how it got fixed — is written down
+in [`DECISIONS.md`](DECISIONS.md) as it happened, rather than reconstructed after the fact.
 
-### Server MCP (Fase 6)
-
-Per usarlo da Claude Code: copia `.mcp.json.example` in `.mcp.json` e sostituisci i percorsi con quelli assoluti
-del tuo checkout, poi approva il server la prima volta che apri una sessione `claude` in questa cartella
-(`claude mcp list` per controllarne lo stato).
-
-## Stato del progetto
-
-| Fase | Contenuto | Stato |
-|---|---|---|
-| 1 | Parser (AST → nodi/archi) | ✅ |
-| 2 | Grafo (`networkx`) + CLI | ✅ |
-| 3 | Layer semantico (embedding + ChromaDB) | ✅ |
-| 4 | Retrieval ibrido | ✅ |
-| 5 | Confronto con/senza retrieval (Claude API) | ✅ |
-| 6 | Server MCP | ✅ |
-| 7 | Confronto con LangGraph (opzionale) | non fatto |
-
-Il piano di progetto è in [`PLAN.md`](PLAN.md); le decisioni tecniche, fase per fase, in [`DECISIONS.md`](DECISIONS.md).
-
-## Limiti noti
-
-- **Analisi statica**: chiamate su variabili di tipo ignoto (`t.update()`) o su attributi assegnati in `__init__`
-  non sono risolte automaticamente; il contesto le segnala comunque in una sezione dedicata, non verificata.
-- **Ricerca semantica imprecisa**: il modello di embedding è generico (non specifico per codice); serve come punto
-  di partenza approssimativo, non come risposta definitiva — per questo si combina con l'espansione sul grafo.
-- **Un solo linguaggio**: solo Python per ora, come da piano.
-- **Valutazione su una libreria nota**: `tqdm` è pubblica e probabilmente nota al modello usato in Fase 5, quindi
-  il confronto "senza contesto" beneficia in parte di conoscenza pregressa; su codice privato il divario sarebbe
-  presumibilmente maggiore.
-
-## Struttura del repository
-
-```
-graph-rag-codebase/
-├── src/                  # parser, grafo, semantica, retrieval, eval, server MCP
-├── output/               # graph.json e graph.html d'esempio (già generati su tqdm)
-├── test_repo/            # repo clonati da analizzare (escluso da git)
-├── PLAN.md               # piano di progetto
-├── DECISIONS.md          # decisioni tecniche, fase per fase
-├── requirements.txt
-└── .mcp.json.example     # configurazione MCP di esempio per Claude Code
-```
+The one caveat worth stating plainly: `tqdm` is a well-known public library, so a model asked to plan a change to
+it "for free," without any retrieved context, still gets some things right just from having seen it during
+training. That's part of why the baseline in the evaluation isn't hopeless. On a private codebase the model has
+never seen, the gap in favor of retrieval would likely be wider — but that's an argument for testing this against
+a repo of your own, not a claim made here.
