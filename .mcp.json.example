@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "graph-rag-codebase": {
+      "command": "/absolute/path/to/graph-rag-codebase/.venv/bin/python",
+      "args": ["-m", "src.mcp_server", "--graph", "output/graph.json", "--db", "output/chroma"],
+      "cwd": "/absolute/path/to/graph-rag-codebase"
+    }
+  }
+}

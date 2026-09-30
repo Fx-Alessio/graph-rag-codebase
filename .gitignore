@@ -4,6 +4,9 @@ __pycache__/
 .venv/
 .env
 
+# specifico alla macchina (percorsi assoluti): vedi .mcp.json.example
+.mcp.json
+
 # note personali
 noteXme/
 
