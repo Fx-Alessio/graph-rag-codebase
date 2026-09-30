@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "graph-rag-codebase": {
+      "command": "/Users/alessiodamico/Desktop/Progetti/graph-rag-codebase/.venv/bin/python",
+      "args": ["-m", "src.mcp_server", "--graph", "output/graph.json", "--db", "output/chroma"],
+      "cwd": "/Users/alessiodamico/Desktop/Progetti/graph-rag-codebase"
+    }
+  }
+}
